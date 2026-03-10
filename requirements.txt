@@ -1,0 +1,5 @@
+# No third-party packages required for core routing logic.
+# The model_router.py script uses only Python standard library modules.
+#
+# Optional: install these if you want to extend or test the router.
+# pytest>=8.0.0

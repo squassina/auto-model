@@ -1,0 +1,162 @@
+name: GitHub AI Model Router
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  issues:
+    types: [opened, edited]
+  issue_comment:
+    types: [created]
+  release:
+    types: [published]
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      event_override:
+        description: "Simulate a GitHub event type (pull_request, issues, push, release, issue_comment)"
+        required: false
+        default: "pull_request"
+      task_override:
+        description: "Override task directly (code_review, security_audit, bug_fix, issue_triage, documentation, release_notes, quick_comment)"
+        required: false
+        default: ""
+      prompt:
+        description: "Prompt to send to the selected model (leave empty to only show routing decision)"
+        required: false
+        default: ""
+
+jobs:
+  route-and-respond:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Determine event and task
+        id: routing
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_EVENT_PATH: ${{ github.event_path }}
+        run: |
+          # Resolve event and optional task overrides
+          EVENT="${{ github.event.inputs.event_override || github.event_name }}"
+          TASK_ARG=""
+          if [ -n "${{ github.event.inputs.task_override }}" ]; then
+            TASK_ARG="--task ${{ github.event.inputs.task_override }}"
+          else
+            TASK_ARG="--event ${EVENT}"
+          fi
+
+          # Run the router (event-file only available on real events)
+          if [ -f "$GITHUB_EVENT_PATH" ]; then
+            python model_router.py \
+              ${TASK_ARG} \
+              --event-file "$GITHUB_EVENT_PATH" \
+              --output routing_result.json
+          else
+            python model_router.py \
+              ${TASK_ARG} \
+              --output routing_result.json
+          fi
+
+          # Expose selected model for downstream steps
+          SELECTED=$(python -c "import json; d=json.load(open('routing_result.json')); print(d['selected_model'])")
+          PROVIDER=$(python -c "import json; d=json.load(open('routing_result.json')); print(d['provider'])")
+          echo "selected_model=${SELECTED}" >> $GITHUB_OUTPUT
+          echo "provider=${PROVIDER}" >> $GITHUB_OUTPUT
+
+      - name: Call AI model (optional — requires API key secret)
+        if: >
+          github.event.inputs.prompt != '' &&
+          (
+            (steps.routing.outputs.provider == 'anthropic' && env.ANTHROPIC_API_KEY != '') ||
+            (steps.routing.outputs.provider == 'openai'    && env.OPENAI_API_KEY    != '')
+          )
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          EVENT="${{ github.event.inputs.event_override || github.event_name }}"
+          TASK_ARG=""
+          if [ -n "${{ github.event.inputs.task_override }}" ]; then
+            TASK_ARG="--task ${{ github.event.inputs.task_override }}"
+          else
+            TASK_ARG="--event ${EVENT}"
+          fi
+
+          python model_router.py \
+            ${TASK_ARG} \
+            --prompt "${{ github.event.inputs.prompt }}" \
+            --call-api \
+            --output routing_result.json
+
+      - name: Post routing decision as PR comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const result = JSON.parse(fs.readFileSync('routing_result.json', 'utf8'));
+            const body = [
+              `### 🤖 AI Model Router`,
+              ``,
+              `| Field | Value |`,
+              `|-------|-------|`,
+              `| **Task** | \`${result.task}\` |`,
+              `| **Selected model** | \`${result.selected_model}\` (${result.provider}) |`,
+              `| **Description** | ${result.description} |`,
+              `| **Input cost** | $${result.cost_per_1k_input_tokens} / 1k tokens |`,
+              `| **Output cost** | $${result.cost_per_1k_output_tokens} / 1k tokens |`,
+              result.response ? `\n**Model response:**\n\n${result.response}` : '',
+            ].join('\n');
+
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+
+      - name: Post routing decision as issue comment
+        if: github.event_name == 'issues'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const result = JSON.parse(fs.readFileSync('routing_result.json', 'utf8'));
+            const body = [
+              `### 🤖 AI Model Router`,
+              ``,
+              `| Field | Value |`,
+              `|-------|-------|`,
+              `| **Task** | \`${result.task}\` |`,
+              `| **Selected model** | \`${result.selected_model}\` (${result.provider}) |`,
+              `| **Description** | ${result.description} |`,
+              result.response ? `\n**Model response:**\n\n${result.response}` : '',
+            ].join('\n');
+
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+
+      - name: Upload routing result artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: routing-result
+          path: routing_result.json
